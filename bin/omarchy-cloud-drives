@@ -1,0 +1,239 @@
+#!/bin/bash
+
+# Connect iCloud Drive, Google Drive and OneDrive as folders under ~/Cloud.
+#
+#   omarchy-cloud-drives state                 JSON state for the panel
+#   omarchy-cloud-drives setup                 install rclone, encrypt config, install mount unit
+#   omarchy-cloud-drives connect <provider>    interactive: sign in and mount
+#   omarchy-cloud-drives disconnect <provider> interactive: unmount and forget the account
+#   omarchy-cloud-drives mount|unmount <provider>
+#   omarchy-cloud-drives open <provider>       open the folder in the file manager
+#   omarchy-cloud-drives launch <cmd...>       run a subcommand in a floating terminal
+#
+# Providers: google, onedrive, icloud.
+#
+# Security model
+#   * rclone's config file (which holds OAuth refresh tokens / the iCloud
+#     session) is encrypted by rclone. The encryption password is a random
+#     256-bit secret stored only in the login keyring (gnome-keyring via
+#     libsecret) and handed to rclone with --password-command; it is never
+#     written to disk in the clear or exported as a variable.
+#   * Google/OneDrive use OAuth in your browser; this script never sees the
+#     account password. iCloud has no OAuth: rclone needs your Apple ID
+#     password once (obscured into the encrypted config) plus a 2FA code.
+#     Consider an app-specific password.
+#   * Mounts are private to your user (umask 077, no allow-other) and run as
+#     hardened systemd user units.
+
+set -euo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MOUNT_ROOT="${OMARCHY_CLOUD_ROOT:-$HOME/Cloud}"
+UNIT_DIR="$HOME/.config/systemd/user"
+UNIT_NAME="omarchy-cloud-drive@"
+ENV_FILE="$HOME/.config/environment.d/60-omarchy-cloud-drives.conf"
+
+SECRET_ATTRS=(service omarchy-cloud-drives key config-password)
+export RCLONE_PASSWORD_COMMAND="secret-tool lookup ${SECRET_ATTRS[*]}"
+export RCLONE_CONFIG="${RCLONE_CONFIG:-$HOME/.config/rclone/rclone.conf}"
+
+# id | rclone remote name (= folder name under ~/Cloud) | backend | display name | glyph
+PROVIDERS=(
+  "google|GoogleDrive|drive|Google Drive|󰊶"
+  "onedrive|OneDrive|onedrive|OneDrive|󰏊"
+  "icloud|iCloudDrive|iclouddrive|iCloud Drive|󰀸"
+)
+
+fail() { echo "omarchy-cloud-drives: $*" >&2; exit 1; }
+
+provider_field() { # provider_field <id> <n>
+  local row
+  for row in "${PROVIDERS[@]}"; do
+    [[ "${row%%|*}" == "$1" ]] && { cut -d'|' -f"$2" <<<"$row"; return; }
+  done
+  fail "unknown provider '$1' (google, onedrive, icloud)"
+}
+remote_of()  { provider_field "$1" 2; }
+backend_of() { provider_field "$1" 3; }
+name_of()    { provider_field "$1" 4; }
+
+have_rclone()  { command -v rclone >/dev/null; }
+have_secret()  { secret-tool lookup "${SECRET_ATTRS[@]}" >/dev/null 2>&1; }
+is_mounted()   { mountpoint -q "$MOUNT_ROOT/$1"; }
+unit_of()      { echo "${UNIT_NAME}$(remote_of "$1").service"; }
+remotes()      { have_rclone && rclone listremotes 2>/dev/null | sed 's/:$//' || true; }
+configured()   { remotes | grep -qx "$(remote_of "$1")"; }
+config_encrypted() { have_rclone && [[ -f $RCLONE_CONFIG ]] && rclone config encryption check >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+cmd_state() {
+  local remote_list; remote_list="$(remotes)"
+  local rows=() row id remote name glyph conf mounted active
+  for row in "${PROVIDERS[@]}"; do
+    IFS='|' read -r id remote _ name glyph <<<"$row"
+    conf=false; grep -qx "$remote" <<<"$remote_list" && conf=true
+    mounted=false; mountpoint -q "$MOUNT_ROOT/$remote" 2>/dev/null && mounted=true
+    active=false; systemctl --user is-active --quiet "${UNIT_NAME}${remote}.service" 2>/dev/null && active=true
+    rows+=("$(jq -nc --arg id "$id" --arg remote "$remote" --arg name "$name" --arg glyph "$glyph" \
+      --arg path "$MOUNT_ROOT/$remote" --argjson configured "$conf" --argjson mounted "$mounted" --argjson active "$active" \
+      '{id:$id,remote:$remote,name:$name,glyph:$glyph,path:$path,configured:$configured,mounted:$mounted,active:$active}')")
+  done
+  local rc=false enc=false key=false
+  have_rclone && rc=true
+  config_encrypted && enc=true
+  have_secret && key=true
+  jq -nc --argjson rclone "$rc" --argjson encrypted "$enc" --argjson keyring "$key" --arg root "$MOUNT_ROOT" \
+    --argjson providers "$(printf '%s\n' "${rows[@]}" | jq -sc .)" \
+    '{rclone:$rclone,encrypted:$encrypted,keyring:$keyring,root:$root,providers:$providers}'
+}
+
+# ---------------------------------------------------------------------------
+ensure_rclone() {
+  have_rclone && return
+  echo "Installing rclone..."
+  omarchy-pkg-add rclone fuse3
+}
+
+ensure_secret() {
+  have_secret && return
+  echo "Creating a config encryption key in your login keyring..."
+  # 256 bits of randomness; never printed, never stored outside the keyring.
+  head -c 32 /dev/urandom | base64 -w0 \
+    | secret-tool store --label="Omarchy Cloud Drives: rclone config password" "${SECRET_ATTRS[@]}"
+  have_secret || fail "could not store the key in the keyring (is gnome-keyring unlocked?)"
+}
+
+ensure_encrypted() {
+  mkdir -p -m 0700 "$(dirname "$RCLONE_CONFIG")"
+  [[ -f $RCLONE_CONFIG ]] || { install -m 0600 /dev/null "$RCLONE_CONFIG"; }
+  chmod 0600 "$RCLONE_CONFIG"
+  config_encrypted && return
+  echo "Encrypting the rclone config with the keyring key..."
+  # With --password-command set, `encryption set` takes the NEW password from it.
+  rclone config encryption set
+  config_encrypted || fail "config encryption failed"
+}
+
+ensure_unit() {
+  mkdir -p "$UNIT_DIR" "$(dirname "$ENV_FILE")" "$MOUNT_ROOT"
+  chmod 0700 "$MOUNT_ROOT"
+  install -m 0644 "$PLUGIN_DIR/systemd/${UNIT_NAME}.service" "$UNIT_DIR/${UNIT_NAME}.service"
+  # So `rclone` in your own terminal can also read the encrypted config.
+  printf 'RCLONE_PASSWORD_COMMAND="%s"\n' "$RCLONE_PASSWORD_COMMAND" >"$ENV_FILE"
+  systemctl --user daemon-reload
+}
+
+cmd_setup() {
+  ensure_rclone
+  ensure_secret
+  ensure_encrypted
+  ensure_unit
+  echo "Cloud Drives is ready. Folders will appear under $MOUNT_ROOT"
+}
+
+# ---------------------------------------------------------------------------
+cmd_connect() {
+  local id="$1" remote backend name
+  remote="$(remote_of "$id")"; backend="$(backend_of "$id")"; name="$(name_of "$id")"
+  cmd_setup
+  if configured "$id"; then
+    echo "$name is already connected."
+  else
+    echo
+    echo "Connecting $name ..."
+    case "$id" in
+      google)
+        echo "A browser window will open for Google sign-in."
+        rclone config create "$remote" drive scope=drive config_is_local=true
+        ;;
+      onedrive)
+        echo "A browser window will open for Microsoft sign-in, then pick your drive."
+        rclone config create "$remote" onedrive
+        ;;
+      icloud)
+        echo "iCloud has no OAuth: rclone signs in with your Apple ID and a 2FA code."
+        echo "Tip: use an app-specific password from https://account.apple.com/account/manage"
+        echo "Advanced Data Protection must be OFF for this account (Apple limitation)."
+        local apple_id pw
+        apple_id="$(gum input --placeholder "Apple ID (email)")"
+        [[ -n $apple_id ]] || fail "no Apple ID given"
+        pw="$(gum input --password --placeholder "Password")"
+        [[ -n $pw ]] || fail "no password given"
+        rclone config create "$remote" iclouddrive apple_id="$apple_id" password="$(rclone obscure "$pw")"
+        unset pw
+        ;;
+    esac
+    configured "$id" || fail "$name was not configured"
+  fi
+  echo "Testing the connection..."
+  rclone about "$remote:" 2>/dev/null || rclone lsd --max-depth 1 "$remote:" >/dev/null
+  cmd_mount "$id"
+  echo "$name is mounted at $MOUNT_ROOT/$remote"
+}
+
+cmd_disconnect() {
+  local id="$1" remote name
+  remote="$(remote_of "$id")"; name="$(name_of "$id")"
+  gum confirm "Disconnect $name and forget its credentials on this machine?" || exit 130
+  cmd_unmount "$id"
+  configured "$id" && rclone config delete "$remote"
+  rmdir "$MOUNT_ROOT/$remote" 2>/dev/null || true
+  echo "$name disconnected."
+}
+
+cmd_mount() {
+  local id="$1" unit; unit="$(unit_of "$id")"
+  configured "$id" || fail "$(name_of "$id") is not connected yet"
+  [[ -f $UNIT_DIR/${UNIT_NAME}.service ]] || ensure_unit
+  systemctl --user enable --now "$unit"
+}
+
+cmd_unmount() {
+  local id="$1" unit; unit="$(unit_of "$id")"
+  systemctl --user disable --now "$unit" 2>/dev/null || true
+  is_mounted "$(remote_of "$id")" && fusermount3 -uz "$MOUNT_ROOT/$(remote_of "$id")" || true
+}
+
+window_for() { # window_for <title>
+  hyprctl clients -j | jq -r --arg t "$1" '[.[] | select(.title == $t and .mapped)] | .[0].address // empty'
+}
+
+focus_window() { # focus_window <address>
+  hyprctl dispatch "hl.dsp.focus({ window = \"address:$1\" })" >/dev/null 2>&1 \
+    || hyprctl dispatch focuswindow "address:$1" >/dev/null 2>&1 || true
+}
+
+cmd_open() {
+  local remote dir addr i; remote="$(remote_of "$1")"; dir="$MOUNT_ROOT/$remote"
+  is_mounted "$remote" || cmd_mount "$1"
+  # Reuse an existing file-manager window for this folder; otherwise open one
+  # and focus it once it maps (it may land on another monitor's workspace).
+  addr="$(window_for "$remote")"
+  if [[ -z $addr ]]; then
+    setsid uwsm-app -- xdg-open "$dir" >/dev/null 2>&1 &
+    for ((i = 0; i < 50; i++)); do
+      addr="$(window_for "$remote")"
+      [[ -n $addr ]] && break
+      read -t 0.1 <> <(:) || true
+    done
+  fi
+  [[ -n $addr ]] && focus_window "$addr"
+  return 0
+}
+
+cmd_launch() {
+  exec omarchy-launch-floating-terminal-with-presentation "$(printf '%q ' "${BASH_SOURCE[0]}" "$@")"
+}
+
+# ---------------------------------------------------------------------------
+case "${1:-}" in
+  state)      cmd_state ;;
+  setup)      cmd_setup ;;
+  connect)    cmd_connect "${2:?provider}" ;;
+  disconnect) cmd_disconnect "${2:?provider}" ;;
+  mount)      cmd_mount "${2:?provider}" ;;
+  unmount)    cmd_unmount "${2:?provider}" ;;
+  open)       cmd_open "${2:?provider}" ;;
+  launch)     shift; cmd_launch "$@" ;;
+  *) sed -n '3,20p' "$0"; exit 1 ;;
+esac
