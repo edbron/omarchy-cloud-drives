@@ -46,6 +46,36 @@ PROVIDERS=(
 
 fail() { echo "omarchy-cloud-drives: $*" >&2; exit 1; }
 
+# write_file <dest> <mode>  (content on stdin)
+# Files under the user's config are written to a securely created temporary
+# file in the destination directory and moved into place with rename(2).
+# rename() is atomic and never follows symlinks, so a planted symlink at the
+# destination is replaced, not written through, and there is no check/open race.
+write_file() {
+  local dest="$1" mode="$2" dir tmp
+  dir="$(dirname "$dest")"
+  mkdir -p -m 0700 "$dir"
+  tmp="$(mktemp "$dir/.$(basename "$dest").XXXXXX")" || fail "cannot create temp file in $dir"
+  if ! cat >"$tmp" || ! chmod "$mode" "$tmp" || ! mv -T -f "$tmp" "$dest"; then
+    rm -f "$tmp"
+    fail "cannot write $dest"
+  fi
+}
+
+# create_private_file <path>: create an empty 0600 regular file only if
+# nothing exists at <path> (link(2) fails on any existing entry, symlinks
+# included, so nothing else can be clobbered or written through).
+create_private_file() {
+  local dest="$1" dir tmp
+  dir="$(dirname "$dest")"
+  mkdir -p -m 0700 "$dir"
+  tmp="$(mktemp "$dir/.$(basename "$dest").XXXXXX")" || fail "cannot create temp file in $dir"
+  chmod 0600 "$tmp"
+  ln "$tmp" "$dest" 2>/dev/null || true
+  rm -f "$tmp"
+  [[ -f $dest && ! -L $dest ]] || fail "$dest exists but is not a regular file"
+}
+
 provider_field() { # provider_field <id> <n>
   local row
   for row in "${PROVIDERS[@]}"; do
@@ -104,9 +134,7 @@ ensure_secret() {
 }
 
 ensure_encrypted() {
-  mkdir -p -m 0700 "$(dirname "$RCLONE_CONFIG")"
-  [[ -f $RCLONE_CONFIG ]] || { install -m 0600 /dev/null "$RCLONE_CONFIG"; }
-  chmod 0600 "$RCLONE_CONFIG"
+  create_private_file "$RCLONE_CONFIG"
   config_encrypted && return
   echo "Encrypting the rclone config with the keyring key..."
   # With --password-command set, `encryption set` takes the NEW password from it.
@@ -115,11 +143,11 @@ ensure_encrypted() {
 }
 
 ensure_unit() {
-  mkdir -p "$UNIT_DIR" "$(dirname "$ENV_FILE")" "$MOUNT_ROOT"
-  chmod 0700 "$MOUNT_ROOT"
-  install -m 0644 "$PLUGIN_DIR/systemd/${UNIT_NAME}.service" "$UNIT_DIR/${UNIT_NAME}.service"
+  mkdir -p -m 0700 "$MOUNT_ROOT"
+  [[ -d $MOUNT_ROOT && ! -L $MOUNT_ROOT ]] || fail "$MOUNT_ROOT is not a directory"
+  write_file "$UNIT_DIR/${UNIT_NAME}.service" 0644 <"$PLUGIN_DIR/systemd/${UNIT_NAME}.service"
   # So `rclone` in your own terminal can also read the encrypted config.
-  printf 'RCLONE_PASSWORD_COMMAND="%s"\n' "$RCLONE_PASSWORD_COMMAND" >"$ENV_FILE"
+  printf 'RCLONE_PASSWORD_COMMAND="%s"\n' "$RCLONE_PASSWORD_COMMAND" | write_file "$ENV_FILE" 0644
   systemctl --user daemon-reload
 }
 
