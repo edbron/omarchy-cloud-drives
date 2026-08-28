@@ -16,7 +16,7 @@ omarchy plugin add https://github.com/edbron/omarchy-cloud-drives.git --enable
 ```
 
 Dependencies (installed on first Connect via `omarchy pkg add`, sudo prompt):
-`rclone`, `fuse3`. Also uses `secret-tool` (libsecret) and `gum`, which ship with Omarchy.
+`rclone`, `fuse3`. Also uses `secret-tool` (libsecret), `gum`, `jq` and `curl`, which ship with Omarchy.
 
 ## Usage
 
@@ -43,7 +43,10 @@ IPC: `omarchy-shell edbron.cloud-drives <state|refresh|toggle|mount ID|unmount I
   Google / Microsoft account security pages.
 - **iCloud** has no OAuth. rclone's `iclouddrive` backend needs your Apple ID
   password once (stored obscured inside the encrypted config) plus a 2FA
-  code. Prefer an app-specific password. Advanced Data Protection must be
+  code. The password is handed to rclone through its rc API over a private
+  unix socket (request body built from stdin), so neither the clear nor the
+  obscured value ever appears in a command line, the environment, logs or a
+  temporary file. Prefer an app-specific password. Advanced Data Protection must be
   off for that Apple ID (Apple does not expose ADP-protected data to
   third-party clients). This backend is marked experimental by rclone.
 - **Mounts** are user-private (`umask 077`, no `allow_other`) and run as

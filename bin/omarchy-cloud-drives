@@ -21,7 +21,9 @@
 #   * Google/OneDrive use OAuth in your browser; this script never sees the
 #     account password. iCloud has no OAuth: rclone needs your Apple ID
 #     password once (obscured into the encrypted config) plus a 2FA code.
-#     Consider an app-specific password.
+#     The password is handed to rclone over a private unix socket (rclone's
+#     rc API) so it never appears in any process's argv, environment, logs
+#     or temporary files. Consider an app-specific password.
 #   * Mounts are private to your user (umask 077, no allow-other) and run as
 #     hardened systemd user units.
 
@@ -160,6 +162,68 @@ cmd_setup() {
 }
 
 # ---------------------------------------------------------------------------
+# Secrets must never be visible in argv (/proc/*/cmdline is world-readable).
+# rclone's CLI only takes remote parameters on the command line, so for
+# password-based backends we talk to rclone's rc API over a private unix
+# socket instead: the request body is built by jq from stdin and streamed
+# to curl from stdin, so the password only ever lives in this shell's
+# memory and in rclone's. The socket lives in a 0700 tmpfs directory for
+# the duration of the sign-in only.
+RC_DIR=""; RC_PID=""
+rc_start() {
+  local run="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  RC_DIR="$(umask 077; mktemp -d "$run/omarchy-cloud-drives.XXXXXX")" || fail "cannot create private socket dir"
+  ( umask 077; exec rclone rcd --rc-addr "unix://$RC_DIR/rc.sock" --rc-no-auth --rc-serve=false -q 2>/dev/null ) &
+  RC_PID=$!
+  local i
+  for i in $(seq 50); do [[ -S $RC_DIR/rc.sock ]] && return 0; sleep 0.1; done
+  rc_stop; fail "rclone rc did not start"
+}
+rc_stop() {
+  if [[ -n $RC_PID ]]; then kill "$RC_PID" 2>/dev/null || true; wait "$RC_PID" 2>/dev/null || true; RC_PID=""; fi
+  if [[ -n $RC_DIR ]]; then rm -rf "$RC_DIR"; RC_DIR=""; fi
+  return 0
+}
+rc_call() {  # rc_call <path>, JSON body on stdin, JSON reply on stdout
+  curl -s --fail-with-body --unix-socket "$RC_DIR/rc.sock" -X POST \
+    -H 'Content-Type: application/json' --data-binary @- "http://rc/$1"
+}
+# Sign in to iCloud non-interactively: create the remote with the password in
+# the request body, then answer rclone's follow-up questions (the 2FA code).
+rc_configure_icloud() {  # <remote> <apple_id> <password>
+  local remote="$1" reply state opt_name opt_help answer
+  rc_start
+  trap rc_stop EXIT
+  reply="$(printf '%s\n%s\n' "$2" "$3" | jq -Rn --arg name "$remote" \
+    '[inputs] | {name:$name, type:"iclouddrive",
+      parameters:{apple_id:.[0], password:.[1]},
+      opt:{obscure:true, nonInteractive:true}}' | rc_call config/create)" || {
+    echo "iCloud sign-in failed: $(jq -r '.error // "unknown error"' <<<"$reply")" >&2
+    rc_stop; return 1; }
+  while :; do
+    state="$(jq -r '.State // ""' <<<"$reply")"
+    if [[ -n "$(jq -r '.Error // ""' <<<"$reply")" ]]; then
+      echo "iCloud sign-in failed: $(jq -r .Error <<<"$reply")" >&2; rc_stop; return 1
+    fi
+    [[ -n $state ]] || break
+    opt_name="$(jq -r '.Option.Name // ""' <<<"$reply")"
+    opt_help="$(jq -r '.Option.Help // ""' <<<"$reply")"
+    [[ -n $opt_help ]] && echo "$opt_help"
+    if [[ $opt_name == *2fa* || $opt_name == *code* ]]; then
+      answer="$(gum input --placeholder "2FA code")"
+    else
+      answer="$(gum input --placeholder "${opt_name:-answer}")"
+    fi
+    reply="$(printf '%s\n%s\n' "$state" "$answer" | jq -Rn --arg name "$remote" \
+      '[inputs] | {name:$name, opt:{continue:true, nonInteractive:true, state:.[0], result:.[1]}}' \
+      | rc_call config/update)" || {
+      echo "iCloud sign-in failed: $(jq -r '.error // "unknown error"' <<<"$reply")" >&2
+      rc_stop; return 1; }
+  done
+  rc_stop; trap - EXIT
+}
+
+# ---------------------------------------------------------------------------
 cmd_connect() {
   local id="$1" remote backend name
   remote="$(remote_of "$id")"; backend="$(backend_of "$id")"; name="$(name_of "$id")"
@@ -187,7 +251,11 @@ cmd_connect() {
         [[ -n $apple_id ]] || fail "no Apple ID given"
         pw="$(gum input --password --placeholder "Password")"
         [[ -n $pw ]] || fail "no password given"
-        rclone config create "$remote" iclouddrive apple_id="$apple_id" password="$(rclone obscure "$pw")"
+        if ! rc_configure_icloud "$remote" "$apple_id" "$pw"; then
+          unset pw
+          rclone config delete "$remote" 2>/dev/null || true
+          fail "could not sign in to iCloud"
+        fi
         unset pw
         ;;
     esac
