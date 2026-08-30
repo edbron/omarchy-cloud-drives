@@ -215,7 +215,7 @@ rc_configure_icloud() {  # <remote> <apple_id> <password>
       answer="$(gum input --placeholder "${opt_name:-answer}")"
     fi
     reply="$(printf '%s\n%s\n' "$state" "$answer" | jq -Rn --arg name "$remote" \
-      '[inputs] | {name:$name, opt:{continue:true, nonInteractive:true, state:.[0], result:.[1]}}' \
+      '[inputs] | {name:$name, parameters:{}, opt:{continue:true, nonInteractive:true, state:.[0], result:.[1]}}' \
       | rc_call config/update)" || {
       echo "iCloud sign-in failed: $(jq -r '.error // "unknown error"' <<<"$reply")" >&2
       rc_stop; return 1; }
