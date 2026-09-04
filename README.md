@@ -1,12 +1,13 @@
 # Cloud Drives — Omarchy plugin
 
-Mount **Google Drive**, **OneDrive** and **iCloud Drive** as folders under
-`~/Cloud/` from a bar widget. Built on [rclone](https://rclone.org).
+Mount **Google Drive**, **OneDrive**, **iCloud Drive** and **Proton Drive** as
+folders under `~/Cloud/` from a bar widget. Built on [rclone](https://rclone.org).
 
 ```
 ~/Cloud/GoogleDrive
 ~/Cloud/OneDrive
 ~/Cloud/iCloudDrive
+~/Cloud/ProtonDrive
 ```
 
 ## Install
@@ -27,7 +28,7 @@ Click the cloud icon in the bar. Each drive has **Connect** (first time),
 Connect and Forget open a floating terminal for the interactive bits
 (browser sign-in, 2FA, confirmation). Everything else is silent.
 
-CLI: `~/.config/omarchy/plugins/edbron.cloud-drives/bin/omarchy-cloud-drives <state|setup|connect|disconnect|mount|unmount|open> [google|onedrive|icloud]`
+CLI: `~/.config/omarchy/plugins/edbron.cloud-drives/bin/omarchy-cloud-drives <state|setup|connect|disconnect|mount|unmount|open> [google|onedrive|icloud|proton]`
 
 IPC: `omarchy-shell edbron.cloud-drives <state|refresh|toggle|mount ID|unmount ID|connect ID>`
 
@@ -49,6 +50,16 @@ IPC: `omarchy-shell edbron.cloud-drives <state|refresh|toggle|mount ID|unmount I
   temporary file. Prefer an app-specific password. Advanced Data Protection must be
   off for that Apple ID (Apple does not expose ADP-protected data to
   third-party clients). This backend is marked experimental by rclone.
+- **Proton Drive** has no OAuth either. rclone's `protondrive` backend needs
+  your Proton email and password, plus a 2FA code and/or the separate
+  mailbox password if your account uses two-password mode. These go to
+  rclone the same way as the iCloud password: over the private rc socket,
+  never argv/env/logs/disk. Proton Drive's encryption keys must already
+  exist — sign in once via a browser or the Proton Drive app before
+  connecting here. Metadata caching (`enable_caching`) is forced off because
+  rclone's own docs warn it doesn't see changes made by other clients, which
+  would go stale under a VFS mount. This backend is marked experimental
+  (Tier 4) by rclone.
 - **Mounts** are user-private (`umask 077`, no `allow_other`) and run as
   systemd user units (`omarchy-cloud-drive@<Remote>.service`) bound to the
   graphical session so they stop with it. The units deliberately carry no
