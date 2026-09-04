@@ -6,7 +6,7 @@ import qs.Ui
 import qs.Commons
 
 // Bar widget + popup for Cloud Drives: one row per provider (Google Drive,
-// OneDrive, iCloud Drive) with connect / mount / open / disconnect actions.
+// OneDrive, iCloud Drive, Proton Drive) with connect / mount / open / disconnect actions.
 // All the work happens in bin/omarchy-cloud-drives; interactive steps
 // (sign-in, 2FA, confirmations) run in a floating terminal.
 Panel {
@@ -280,7 +280,7 @@ Panel {
         Text {
           width: parent.width
           wrapMode: Text.WordWrap
-          text: "Sign-in happens in your browser (Google, Microsoft) or via Apple ID + 2FA (iCloud). Tokens are stored in an rclone config encrypted with a key that only lives in your login keyring."
+          text: "Sign-in happens in your browser (Google, Microsoft) or via account + 2FA (iCloud, Proton). Tokens are stored in an rclone config encrypted with a key that only lives in your login keyring."
           color: root.dim
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.caption

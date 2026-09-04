@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# Connect iCloud Drive, Google Drive and OneDrive as folders under ~/Cloud.
+# Connect iCloud Drive, Google Drive, OneDrive and Proton Drive as folders
+# under ~/Cloud.
 #
 #   omarchy-cloud-drives state                 JSON state for the panel
 #   omarchy-cloud-drives setup                 install rclone, encrypt config, install mount unit
@@ -10,20 +11,23 @@
 #   omarchy-cloud-drives open <provider>       open the folder in the file manager
 #   omarchy-cloud-drives launch <cmd...>       run a subcommand in a floating terminal
 #
-# Providers: google, onedrive, icloud.
+# Providers: google, onedrive, icloud, proton.
 #
 # Security model
 #   * rclone's config file (which holds OAuth refresh tokens / the iCloud
-#     session) is encrypted by rclone. The encryption password is a random
-#     256-bit secret stored only in the login keyring (gnome-keyring via
-#     libsecret) and handed to rclone with --password-command; it is never
-#     written to disk in the clear or exported as a variable.
+#     and Proton Drive session material) is encrypted by rclone. The
+#     encryption password is a random 256-bit secret stored only in the
+#     login keyring (gnome-keyring via libsecret) and handed to rclone with
+#     --password-command; it is never written to disk in the clear or
+#     exported as a variable.
 #   * Google/OneDrive use OAuth in your browser; this script never sees the
-#     account password. iCloud has no OAuth: rclone needs your Apple ID
-#     password once (obscured into the encrypted config) plus a 2FA code.
-#     The password is handed to rclone over a private unix socket (rclone's
-#     rc API) so it never appears in any process's argv, environment, logs
-#     or temporary files. Consider an app-specific password.
+#     account password. iCloud and Proton Drive have no OAuth: rclone needs
+#     the account password once (obscured into the encrypted config), plus
+#     a 2FA code for iCloud, or a 2FA/mailbox password for Proton accounts
+#     that use them. Those secrets are handed to rclone over a private unix
+#     socket (rclone's rc API) so they never appear in any process's argv,
+#     environment, logs or temporary files. Consider an app-specific
+#     password for iCloud.
 #   * Mounts are private to your user (umask 077, no allow-other) and run as
 #     hardened systemd user units.
 
@@ -44,6 +48,7 @@ PROVIDERS=(
   "google|GoogleDrive|drive|Google Drive|󰊶"
   "onedrive|OneDrive|onedrive|OneDrive|󰏊"
   "icloud|iCloudDrive|iclouddrive|iCloud Drive|󰀸"
+  "proton|ProtonDrive|protondrive|Proton Drive|󰦝"
 )
 
 fail() { echo "omarchy-cloud-drives: $*" >&2; exit 1; }
@@ -83,7 +88,7 @@ provider_field() { # provider_field <id> <n>
   for row in "${PROVIDERS[@]}"; do
     [[ "${row%%|*}" == "$1" ]] && { cut -d'|' -f"$2" <<<"$row"; return; }
   done
-  fail "unknown provider '$1' (google, onedrive, icloud)"
+  fail "unknown provider '$1' (google, onedrive, icloud, proton)"
 }
 remote_of()  { provider_field "$1" 2; }
 backend_of() { provider_field "$1" 3; }
@@ -223,6 +228,46 @@ rc_configure_icloud() {  # <remote> <apple_id> <password>
   rc_stop; trap - EXIT
 }
 
+# Sign in to Proton Drive non-interactively: username/password (and,
+# optionally, a 2FA code and the separate mailbox password used by
+# two-password-mode accounts) go straight into config/create's request body.
+# Unlike iCloud, rclone's protondrive backend takes no further follow-up
+# questions during config -- it logs in lazily on first real use -- but the
+# same continue/state handling is kept below in case that ever changes.
+# enable_caching is forced off: rclone's own docs warn its metadata cache is
+# unaware of external changes and should stay disabled behind a VFS mount.
+rc_configure_protondrive() {  # <remote> <username> <password> <twofa> <mailbox_password>
+  local remote="$1" reply state opt_name opt_help answer
+  rc_start
+  trap rc_stop EXIT
+  reply="$(printf '%s\n%s\n%s\n%s\n' "$2" "$3" "$4" "$5" | jq -Rn --arg name "$remote" '
+    [inputs] as $in
+    | {name:$name, type:"protondrive",
+       parameters: ({username:$in[0], password:$in[1], enable_caching:"false"}
+         + (if $in[2] != "" then {"2fa":$in[2]} else {} end)
+         + (if $in[3] != "" then {mailbox_password:$in[3]} else {} end)),
+       opt:{obscure:true, nonInteractive:true}}' | rc_call config/create)" || {
+    echo "Proton Drive sign-in failed: $(jq -r '.error // "unknown error"' <<<"$reply")" >&2
+    rc_stop; return 1; }
+  while :; do
+    state="$(jq -r '.State // ""' <<<"$reply")"
+    if [[ -n "$(jq -r '.Error // ""' <<<"$reply")" ]]; then
+      echo "Proton Drive sign-in failed: $(jq -r .Error <<<"$reply")" >&2; rc_stop; return 1
+    fi
+    [[ -n $state ]] || break
+    opt_name="$(jq -r '.Option.Name // ""' <<<"$reply")"
+    opt_help="$(jq -r '.Option.Help // ""' <<<"$reply")"
+    [[ -n $opt_help ]] && echo "$opt_help"
+    answer="$(gum input --placeholder "${opt_name:-answer}")"
+    reply="$(printf '%s\n%s\n' "$state" "$answer" | jq -Rn --arg name "$remote" \
+      '[inputs] | {name:$name, opt:{continue:true, nonInteractive:true, state:.[0], result:.[1]}}' \
+      | rc_call config/update)" || {
+      echo "Proton Drive sign-in failed: $(jq -r '.error // "unknown error"' <<<"$reply")" >&2
+      rc_stop; return 1; }
+  done
+  rc_stop; trap - EXIT
+}
+
 # ---------------------------------------------------------------------------
 cmd_connect() {
   local id="$1" remote backend name
@@ -257,6 +302,27 @@ cmd_connect() {
           fail "could not sign in to iCloud"
         fi
         unset pw
+        ;;
+      proton)
+        echo "Proton Drive has no OAuth: rclone signs in with your Proton email and password."
+        echo "Your Proton Drive encryption keys must already exist -- log in via a browser or"
+        echo "the Proton Drive app at least once first if you haven't."
+        local email pw twofa mbpw
+        email="$(gum input --placeholder "Proton email")"
+        [[ -n $email ]] || fail "no email given"
+        pw="$(gum input --password --placeholder "Password")"
+        [[ -n $pw ]] || fail "no password given"
+        twofa="$(gum input --placeholder "2FA code (leave blank if not enabled)")"
+        mbpw=""
+        if gum confirm "Two-password mode (separate mailbox password)?"; then
+          mbpw="$(gum input --password --placeholder "Mailbox password")"
+        fi
+        if ! rc_configure_protondrive "$remote" "$email" "$pw" "$twofa" "$mbpw"; then
+          unset pw mbpw
+          rclone config delete "$remote" 2>/dev/null || true
+          fail "could not sign in to Proton Drive"
+        fi
+        unset pw mbpw
         ;;
     esac
     configured "$id" || fail "$name was not configured"
